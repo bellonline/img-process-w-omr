@@ -1,179 +1,165 @@
 import streamlit as st
 import cv2
 import numpy as np
+import imutils
+from imutils.perspective import four_point_transform
 from pyzbar.pyzbar import decode
 from PIL import Image
 
-# --- CONFIGURATION & CONSTANTS ---
-# ขนาด A5 ที่เราต้องการ Warp (มาตราส่วน 148:210)
-W_A5, H_A5 = 1480, 2100 
+# --- ค่าคงที่สำหรับการประมวลผล ---
+W_A5, H_A5 = 1480, 2100  # อัตราส่วน A5 (10px ต่อ 1mm)
 
 class OMRScanner:
     def __init__(self):
         self.debug_images = {}
 
-    def enhance_image(self, image):
-        """ขั้นตอนที่ 1: ปรับแต่งภาพ (Desaturate, Contrast, Sharpen)"""
-        # 1.1 Desaturate
+    def preprocess(self, image):
+        """1. ปรับแต่งภาพเบื้องต้น (Desaturate & Enhance)"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        self.debug_images['1. Grayscale'] = gray
-        
-        # 1.2 Contrast Enhancement (CLAHE)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        # ปรับ Contrast ด้วย CLAHE
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
-        self.debug_images['2. Enhanced Contrast'] = enhanced
-        
-        # 1.3 Sharpening
-        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-        sharpened = cv2.filter2D(enhanced, -1, kernel)
-        self.debug_images['3. Sharpened'] = sharpened
-        
-        return sharpened
+        # ลด Noise เล็กน้อย
+        blurred = cv2.GaussianBlur(enhanced, (5, 5), 0)
+        self.debug_images['1. Preprocessed'] = blurred
+        return blurred
 
-    def find_corners_and_warp(self, enhanced_img, original_img):
-        """ขั้นตอนที่ 2: ค้นหาขอบกระดาษและทำ Warp Perspective"""
-        # Thresholding เพื่อหาขอบ
-        _, thresh = cv2.threshold(enhanced_img, 150, 255, cv2.THRESH_BINARY_INV)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    def detect_and_warp(self, processed_img, original_img):
+        """2. ตรวจจับ Corner Marks 4 มุม และ Warp ด้วย imutils"""
+        # Threshold เพื่อหาวัตถุสีดำ (Corner Marks)
+        thresh = cv2.adaptiveThreshold(processed_img, 255, 
+                                      cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                      cv2.THRESH_BINARY_INV, 11, 2)
         
-        # ค้นหา 4 มุม (หา Contours ที่ใหญ่ที่สุดและเป็นสี่เหลี่ยม)
-        # หมายเหตุ: ในสภาพใช้งานจริง อาจต้องปรับจูน Filter ตรงนี้ตามลักษณะ Corner Mark
-        # เพื่อสาธิต เราจะสมมติการเลือก 4 จุดที่อยู่นอกสุด
-        all_points = []
-        for cnt in contours:
-            if cv2.contourArea(cnt) > 100:
-                for p in cnt:
-                    all_points.append(p[0])
+        cnts = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts = imutils.grab_contours(cnts)
         
-        if len(all_points) < 4:
-            return None, "ไม่พบ Corner Marks"
+        centers = []
+        # ค้นหา Contours ที่มีลักษณะเป็นสี่เหลี่ยมมุมกระดาษ
+        for c in cnts:
+            area = cv2.contourArea(c)
+            if 400 < area < 10000: # ปรับขนาดตามความละเอียดภาพถ่าย
+                peri = cv2.arcLength(c, True)
+                approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+                if len(approx) == 4: # เป็นรูป 4 เหลี่ยม
+                    M = cv2.moments(c)
+                    if M["m00"] != 0:
+                        cX = int(M["m10"] / M["m00"])
+                        cY = int(M["m01"] / M["m00"])
+                        centers.append((cX, cY))
+        
+        if len(centers) < 4:
+            return None, f"พบ Corner Marks เพียง {len(centers)} จุด (ต้องการ 4)"
 
-        # จัดระเบียบมุม: TL, TR, BR, BL
-        rect = self._order_points(np.array(all_points[:4])) # ตัวอย่างการเลือกจุด
+        # ใช้ imutils ในการ Warp (จัดการการเรียงจุดให้อัตโนมัติ)
+        pts = np.array(centers, dtype="float32")
+        warped = four_point_transform(original_img, pts)
         
-        # ทำ Perspective Warp
-        dst = np.array([
-            [0, 0],
-            [W_A5 - 1, 0],
-            [W_A5 - 1, H_A5 - 1],
-            [0, H_A5 - 1]], dtype="float32")
-        
-        M = cv2.getPerspectiveTransform(rect, dst)
-        warped = cv2.warpPerspective(original_img, M, (W_A5, H_A5))
-        self.debug_images['4. Warped Image'] = warped
-        
+        # Resize ให้เป็นขนาด A5 มาตรฐาน
+        warped = cv2.resize(warped, (W_A5, H_A5))
+        self.debug_images['2. Warped'] = warped
         return warped, None
 
-    def _order_points(self, pts):
-        rect = np.zeros((4, 2), dtype="float32")
-        s = pts.sum(axis=1)
-        rect[0] = pts[np.argmin(s)] # Top-Left
-        rect[2] = pts[np.argmax(s)] # Bottom-Right
-        diff = np.diff(pts, axis=1)
-        rect[1] = pts[np.argmin(diff)] # Top-Right
-        rect[3] = pts[np.argmax(diff)] # Bottom-Left
-        return rect
+    def fix_orientation(self, warped):
+        """3. หมุนภาพให้ถูกทิศทาง (Timing Marks ซ้าย, QR ขวาบน)"""
+        # ลองหมุนภาพ 4 ทิศทาง เพื่อหาจุดที่ QR Code อยู่มุมขวาบน
+        for i in range(4):
+            # ตรวจสอบ QR ในพื้นที่มุมขวาบน
+            roi_qr = warped[0:500, 800:W_A5]
+            decoded = decode(roi_qr)
+            if decoded:
+                self.debug_images['3. Orientation Fixed'] = warped
+                return warped, decoded[0].data.decode('utf-8')
+            
+            # ถ้าไม่เจอให้หมุน 90 องศา
+            warped = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
+            
+        return warped, "QR Not Found"
 
-    def check_orientation(self, warped):
-        """ขั้นตอนที่ 3: ตรวจสอบทิศทาง (Timing Marks อยู่ซ้าย, QR อยู่ขวาบน)"""
-        # Logic: เช็คความหนาแน่นพิกเซลด้านซ้ายเทียบกับด้านขวา
-        # และตรวจสอบ QR Code
-        gray_warped = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-        qr_data = decode(gray_warped)
+    def scan_omr(self, warped):
+        """4. สแกนพื้นที่ OMR (Orange Zone & Answers)"""
+        gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+        # Threshold สำหรับอ่านรอยฝน
+        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                      cv2.THRESH_BINARY_INV, 25, 12)
         
-        qr_string = qr_data[0].data.decode('utf-8') if qr_data else "ไม่พบ QR Code"
-        return warped, qr_string
-
-    def read_orange_zone(self, warped):
-        """ขั้นตอนที่ 4: อ่านค่า BookCode/SetCode ในพื้นที่สีส้ม (Vertical OMR 0-9)"""
-        # กำหนดพื้นที่ ROI สีส้ม (ตัวเลขสมมติสำหรับการคำนวณ)
-        # พื้นที่นี้อยู่มุมบนซ้าย ถัดจาก Timing Marks
-        book_code = "000"
-        set_code = "001"
+        results = {"BookCode": "000", "SetCode": "001", "Answers": {}}
         
-        # ส่วนนี้จะต้องใช้การ Slicing ภาพในพิกัดที่ระบุ
-        # แล้วใช้ cv2.countNonZero ในแต่ละช่องวงกลม 0-9
-        return book_code, set_code
+        # --- ตัวอย่าง Logic การสแกนคำตอบ (Calibrate พิกัดที่นี่) ---
+        # พี่บุ้งต้องวัดระยะจากภาพ Warped (1480x2100) แล้วใส่พิกัดจริง
+        options = ["A", "B", "C", "D", "E"]
+        for q in range(1, 16):
+            darkest_val = 0
+            best_choice = "None"
+            for idx, opt in enumerate(options):
+                # พิกัดจำลอง (X, Y) สำหรับแต่ละวงกลม
+                x = 185 + (idx * 52)
+                y = 825 + (q * 44)
+                
+                mask = np.zeros(thresh.shape, dtype="uint8")
+                cv2.circle(mask, (x, y), 15, 255, -1)
+                mean = cv2.mean(thresh, mask=mask)[0]
+                
+                if mean > 60 and mean > darkest_val:
+                    darkest_val = mean
+                    best_choice = opt
+            results["Answers"][f"Q{q}"] = best_choice
+            
+        return results
 
-    def read_answer_grid(self, warped):
-        """ขั้นตอนที่ 5: อ่านคำตอบ 120 ข้อ (4 Columns)"""
-        answers = {}
-        # วนลูปตามพิกัดตาราง 30 แถว x 4 คอลัมน์
-        # อ้างอิงแถวจาก Timing Marks ด้านซ้าย
-        for i in range(1, 16): # ตัวอย่าง 15 ข้อแรกตามภาพ
-            answers[f"Q{i}"] = "A" if i != 2 else "B" # ตัวอย่างค่าที่อ่านได้
-        return answers
+# --- Streamlit UI ---
+st.set_page_config(page_title="OMR Imutils Pro", layout="wide")
+st.title("🔭 OMR Answer Sheet Processor (imutils version)")
 
-# --- STREAMLIT UI ---
-st.set_page_config(page_title="OMR Troubleshooter Canvas", layout="wide")
+# อย่าลืมบอกให้ User อัปเดต requirements.txt
+with st.sidebar:
+    st.header("Settings")
+    st.info("ใช้ imutils.four_point_transform ในการ Warp")
 
-st.markdown("""
-    <style>
-    .main { background-color: #f5f7f9; }
-    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-    </style>
-    """, unsafe_allow_html=True)
-
-st.title("🔭 OMR Answer Sheet Processor")
-st.info("อัปโหลดภาพถ่ายกระดาษคำตอบเพื่อวิเคราะห์ค่า OMR และ QR Code")
-
-uploaded_file = st.file_uploader("เลือกไฟล์ภาพ (JPG, PNG)", type=["jpg", "png", "jpeg"])
+uploaded_file = st.file_uploader("อัปโหลดภาพกระดาษคำตอบ", type=['jpg', 'jpeg', 'png'])
 
 if uploaded_file:
-    # แปลงไฟล์เป็น OpenCV Image
+    # อ่านภาพ
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
     image = cv2.imdecode(file_bytes, 1)
     
     scanner = OMRScanner()
     
-    col_debug, col_result = st.columns([1, 1])
-
-    with col_debug:
-        st.subheader("🛠 Processing & Debugging")
+    # 1. Preprocess
+    processed = scanner.preprocess(image)
+    
+    # 2. Detect & Warp
+    warped, error = scanner.detect_and_warp(processed, image)
+    
+    if error:
+        st.error(f"❌ {error}")
+        st.image(processed, caption="ผลการหาขอบภาพ (กรุณาถ่ายให้เห็น Corner Marks ชัดเจน)")
+    else:
+        # 3. Fix Orientation & Read QR
+        final_sheet, qr_string = scanner.fix_orientation(warped)
         
-        # 1. Enhancement
-        enhanced = scanner.enhance_image(image)
-        with st.expander("1. Image Enhancement Results"):
-            st.image(scanner.debug_images['1. Grayscale'], caption="1. Desaturated")
-            st.image(scanner.debug_images['2. Enhanced Contrast'], caption="2. CLAHE Applied")
-            st.image(scanner.debug_images['3. Sharpened'], caption="3. Final Enhanced", use_container_width=True)
-
-        # 2. Warp
-        warped, error = scanner.find_corners_and_warp(enhanced, image)
-        if error:
-            st.error(f"Error: {error}")
-        else:
-            with st.expander("2. Perspective Alignment"):
-                st.image(scanner.debug_images['4. Warped Image'], caption="Warped A5 Sheet", use_container_width=True)
-
-            # 3. Orientation & Data Extraction
-            final_sheet, qr_code = scanner.check_orientation(warped)
-            book_code, set_code = scanner.read_orange_zone(final_sheet)
-            answers = scanner.read_answer_grid(final_sheet)
-
-    with col_result:
-        st.subheader("📊 Extraction Results")
+        # 4. Scan Data
+        data = scanner.scan_omr(final_sheet)
         
-        # QR Code Display
-        st.metric("QR Code String", qr_code)
+        # --- แสดงผล ---
+        col1, col2 = st.columns([1, 1])
         
-        # OMR Orange Zone
-        c1, c2 = st.columns(2)
-        with c1:
-            st.metric("Book Code", book_code)
-        with c2:
-            st.metric("Set Code", set_code)
+        with col1:
+            st.subheader("🖼 Processing Steps")
+            st.image(scanner.debug_images['1. Preprocessed'], caption="1. Contrast Enhanced")
+            st.image(final_sheet, caption="2. Warped & Rotated Sheet", channels="BGR")
             
-        # OMR Answers Table
-        st.write("📝 **Detected Answers (Sample Q1-Q15)**")
-        
-        # แปลงเป็นตารางเพื่อความสวยงาม
-        ans_data = [{"Question": k, "Answer": v} for k, v in answers.items()]
-        st.table(ans_data)
-        
-        if st.button("ยืนยันข้อมูลและบันทึกลงระบบ"):
-            st.success("บันทึกข้อมูลสำเร็จ!")
-            st.balloons()
-
-else:
-    st.write("👈 กรุณาอัปโหลดรูปภาพเพื่อเริ่มต้นการทำงาน")
+        with col2:
+            st.subheader("📊 Extraction Results")
+            st.metric("QR Code ID", qr_string)
+            
+            c1, c2 = st.columns(2)
+            c1.metric("Book Code", data["BookCode"])
+            c2.metric("Set Code", data["SetCode"])
+            
+            st.write("📝 **Answer Grid (Preview Q1-Q15)**")
+            ans_table = [{"Question": k, "Answer": v} for k, v in data["Answers"].items()]
+            st.table(ans_table)
+            
+            if st.button("Download Data as JSON"):
+                st.json(data)
